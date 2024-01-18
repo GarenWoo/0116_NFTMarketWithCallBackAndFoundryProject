@@ -33,15 +33,17 @@ contract NFTMarket is IERC721Receiver {
     }
 
     function tokensReceived(
-        address _nftAddr,
-        uint _tokenId,
-        uint _bid
+        address _recipient,
+        address _calledContract,
+        uint _amount,
+        bytes calldata _data
     ) external {
-        _buyNFT(_nftAddr, _tokenId, _bid);
+        (address nftAddress, uint256 tokenId) = _decode(_data);
+        _updateNFT(_recipient, _calledContract, nftAddress, tokenId, _amount);
     }
 
     // Before calling this function, need to approve this contract as an operator of the corresponding tokenId!
-    function list(address _nftAddr, uint _tokenId, uint _price) external {
+    function list(address _nftAddr, uint256 _tokenId, uint _price) external {
         if (msg.sender != IERC721(_nftAddr).ownerOf(_tokenId))
             revert NotOwner();
         if (_price == 0) revert ZeroPrice();
@@ -78,8 +80,8 @@ contract NFTMarket is IERC721Receiver {
     }
 
     // Before calling this function, need to approve this contract with enough allowance!
-    function buy(address _nftAddr, uint _tokenId, uint _bid) external {
-        _buyNFT(_nftAddr, _tokenId, _bid);
+    function buy(address _nftAddr, uint256 _tokenId, uint _bid) external {
+        _updateNFT(msg.sender, address(this), _nftAddr, _tokenId, _bid);
     }
 
     function withdrawBalance(uint _value) external {
@@ -90,24 +92,45 @@ contract NFTMarket is IERC721Receiver {
         balance[msg.sender] -= _value;
     }
 
-    function _buyNFT(address _nftAddr, uint _tokenId, uint _bid) internal {
-        if (onSale[_nftAddr][_tokenId] != true) revert NotOnSale();
-        if (_bid < price[_nftAddr][_tokenId])
-            revert BidLessThanPrice(_bid, price[_nftAddr][_tokenId]);
+    function _updateNFT(
+        address _recipient,
+        address _calledContract,
+        address _nftAddr,
+        uint256 _tokenId,
+        uint _tokenAmount
+    ) internal {
+        if (onSale[_nftAddr][_tokenId] != true) {
+            revert NotOnSale();
+        }
+        if (_tokenAmount < price[_nftAddr][_tokenId]) {
+            revert BidLessThanPrice(_tokenAmount, price[_nftAddr][_tokenId]);
+        }
         require(
-            msg.sender != IERC721(_nftAddr).getApproved(_tokenId),
+            // When NFT listed, the original owner(EOA, the seller) should be approved. So, this EOA can delist NFT whenever he/she wants.
+            // After NFT is listed successfully, getApproved() will return the orginal owner of the listed NFT.
+            _recipient != IERC721(_nftAddr).getApproved(_tokenId),
             "Owner cannot buy!"
         );
+        balance[IERC721(_nftAddr).getApproved(_tokenId)] += _tokenAmount;
         bool _success = IERC20(tokenAddr).transferFrom(
-            msg.sender,
-            address(this),
-            _bid
+            _recipient,
+            _calledContract,
+            _tokenAmount
         );
         require(_success, "Fail to buy or Allowance is insufficient");
-        balance[IERC721(_nftAddr).getApproved(_tokenId)] += _bid;
-        IERC721(_nftAddr).transferFrom(address(this), msg.sender, _tokenId);
+        IERC721(_nftAddr).transferFrom(_calledContract, _recipient, _tokenId);
         delete price[_nftAddr][_tokenId];
         onSale[_nftAddr][_tokenId] = false;
+    }
+
+    function _decode(
+        bytes calldata _data
+    ) public pure returns (address, uint256) {
+        (address NFTAddress, uint256 rawTokenId) = abi.decode(
+            _data,
+            (address, uint256)
+        );
+        return (NFTAddress, rawTokenId);
     }
 
     function getPrice(

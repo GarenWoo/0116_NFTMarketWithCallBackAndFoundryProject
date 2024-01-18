@@ -10,17 +10,24 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 interface ITokenBank {
     function tokensReceived(address, uint) external returns (bool);
 }
+
 interface INFTMarket {
-    function tokensReceived(address, uint, uint) external returns (bool);
+    function tokensReceived(
+        address,
+        address,
+        uint,
+        bytes calldata
+    ) external;
 }
 
 contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
     using SafeERC20 for ERC777TokenGTT;
     using Address for address;
-    address private owner;
+    address public owner;
     error NotOwner(address caller);
     error NoTokenReceived();
-    error transferFail();
+    error transferTokenFail();
+    error NotContract();
     event TokenMinted(uint amount, uint timestamp);
 
     constructor()
@@ -44,19 +51,17 @@ contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
         emit TokenMinted(_amount, block.timestamp);
     }
 
+    // ERC20 Token Callback:
     function transferWithCallback(
         address _to,
         uint _amount
     ) external nonReentrant returns (bool) {
         bool transferSuccess = transfer(_to, _amount);
         if (!transferSuccess) {
-            revert transferFail();
+            revert transferTokenFail();
         }
         if (_isContract(_to)) {
-            bool success = ITokenBank(_to).tokensReceived(
-                msg.sender,
-                _amount
-            );
+            bool success = ITokenBank(_to).tokensReceived(msg.sender, _amount);
             if (!success) {
                 revert NoTokenReceived();
             }
@@ -64,26 +69,27 @@ contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
         return true;
     }
 
-    function transferForNFTWithCallback(
+    // ERC721 Token Callback:
+    // @param: _data contains information of NFT, including ERC721Token address, tokenId and other potential information.
+    function transferWithCallbackForNFT(
         address _to,
-        uint _tokenId,
-        uint _bid
+        uint _bidAmount,
+        bytes calldata _data
     ) external nonReentrant returns (bool) {
-        bool transferSuccess = transfer(_to, _bid);
-        if (!transferSuccess) {
-            revert transferFail();
-        }
         if (_isContract(_to)) {
-            bool success = INFTMarket(_to).tokensReceived(
-                msg.sender,
-                _tokenId,
-                _bid
-            );
-            if (!success) {
-                revert NoTokenReceived();
-            }
+            INFTMarket(_to).tokensReceived(msg.sender, _to, _bidAmount, _data);
+        } else {
+            revert NotContract();
         }
         return true;
+    }
+
+    function getBytesOfNFTInfo(
+        address _NFTAddr,
+        uint256 _tokenId
+    ) public pure returns (bytes memory) {
+        bytes memory NFTInfo = abi.encode(_NFTAddr, _tokenId);
+        return NFTInfo;
     }
 
     function _isContract(address account) internal view returns (bool) {

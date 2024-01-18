@@ -40,15 +40,17 @@ contract NFTMarket is IERC721Receiver {
     }
 
     function tokensReceived(
-        address _nftAddr,
-        uint _tokenId,
-        uint _bid
+        address _recipient,
+        address _calledContract,
+        uint _amount,
+        bytes calldata _data
     ) external {
-        _buyNFT(_nftAddr, _tokenId, _bid);
+        (address nftAddress, uint256 tokenId) = _decode(_data);
+        _updateNFT(_recipient, _calledContract, nftAddress, tokenId, _amount);
     }
 
     // Before calling this function, need to approve this contract as an operator of the corresponding tokenId!
-    function list(address _nftAddr, uint _tokenId, uint _price) external {
+    function list(address _nftAddr, uint256 _tokenId, uint _price) external {
         if (msg.sender != IERC721(_nftAddr).ownerOf(_tokenId))
             revert NotOwner();
         if (_price == 0) revert ZeroPrice();
@@ -85,8 +87,8 @@ contract NFTMarket is IERC721Receiver {
     }
 
     // Before calling this function, need to approve this contract with enough allowance!
-    function buy(address _nftAddr, uint _tokenId, uint _bid) external {
-        _buyNFT(_nftAddr, _tokenId, _bid);
+    function buy(address _nftAddr, uint256 _tokenId, uint _bid) external {
+        _updateNFT(msg.sender, address(this), _nftAddr, _tokenId, _bid);
     }
 
     function withdrawBalance(uint _value) external {
@@ -97,24 +99,45 @@ contract NFTMarket is IERC721Receiver {
         balance[msg.sender] -= _value;
     }
 
-    function _buyNFT(address _nftAddr, uint _tokenId, uint _bid) internal {
-        if (onSale[_nftAddr][_tokenId] != true) revert NotOnSale();
-        if (_bid < price[_nftAddr][_tokenId])
-            revert BidLessThanPrice(_bid, price[_nftAddr][_tokenId]);
+    function _updateNFT(
+        address _recipient,
+        address _calledContract,
+        address _nftAddr,
+        uint256 _tokenId,
+        uint _tokenAmount
+    ) internal {
+        if (onSale[_nftAddr][_tokenId] != true) {
+            revert NotOnSale();
+        }
+        if (_tokenAmount < price[_nftAddr][_tokenId]) {
+            revert BidLessThanPrice(_tokenAmount, price[_nftAddr][_tokenId]);
+        }
         require(
-            msg.sender != IERC721(_nftAddr).getApproved(_tokenId),
+            // When NFT listed, the original owner(EOA, the seller) should be approved. So, this EOA can delist NFT whenever he/she wants.
+            // After NFT is listed successfully, getApproved() will return the orginal owner of the listed NFT.
+            _recipient != IERC721(_nftAddr).getApproved(_tokenId),
             "Owner cannot buy!"
         );
+        balance[IERC721(_nftAddr).getApproved(_tokenId)] += _tokenAmount;
         bool _success = IERC20(tokenAddr).transferFrom(
-            msg.sender,
-            address(this),
-            _bid
+            _recipient,
+            _calledContract,
+            _tokenAmount
         );
         require(_success, "Fail to buy or Allowance is insufficient");
-        balance[IERC721(_nftAddr).getApproved(_tokenId)] += _bid;
-        IERC721(_nftAddr).transferFrom(address(this), msg.sender, _tokenId);
+        IERC721(_nftAddr).transferFrom(_calledContract, _recipient, _tokenId);
         delete price[_nftAddr][_tokenId];
         onSale[_nftAddr][_tokenId] = false;
+    }
+
+    function _decode(
+        bytes calldata _data
+    ) public pure returns (address, uint256) {
+        (address NFTAddress, uint256 rawTokenId) = abi.decode(
+            _data,
+            (address, uint256)
+        );
+        return (NFTAddress, rawTokenId);
     }
 
     function getPrice(
@@ -152,17 +175,24 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 interface ITokenBank {
     function tokensReceived(address, uint) external returns (bool);
 }
+
 interface INFTMarket {
-    function tokensReceived(address, uint, uint) external returns (bool);
+    function tokensReceived(
+        address,
+        address,
+        uint,
+        bytes calldata
+    ) external;
 }
 
 contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
     using SafeERC20 for ERC777TokenGTT;
     using Address for address;
-    address private owner;
+    address public owner;
     error NotOwner(address caller);
     error NoTokenReceived();
-    error transferFail();
+    error transferTokenFail();
+    error NotContract();
     event TokenMinted(uint amount, uint timestamp);
 
     constructor()
@@ -186,19 +216,17 @@ contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
         emit TokenMinted(_amount, block.timestamp);
     }
 
+    // ERC20 Token Callback:
     function transferWithCallback(
         address _to,
         uint _amount
     ) external nonReentrant returns (bool) {
         bool transferSuccess = transfer(_to, _amount);
         if (!transferSuccess) {
-            revert transferFail();
+            revert transferTokenFail();
         }
         if (_isContract(_to)) {
-            bool success = ITokenBank(_to).tokensReceived(
-                msg.sender,
-                _amount
-            );
+            bool success = ITokenBank(_to).tokensReceived(msg.sender, _amount);
             if (!success) {
                 revert NoTokenReceived();
             }
@@ -206,26 +234,27 @@ contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
         return true;
     }
 
-    function transferForNFTWithCallback(
+    // ERC721 Token Callback:
+    // @param: _data contains information of NFT, including ERC721Token address, tokenId and other potential information.
+    function transferWithCallbackForNFT(
         address _to,
-        uint _tokenId,
-        uint _bid
+        uint _bidAmount,
+        bytes calldata _data
     ) external nonReentrant returns (bool) {
-        bool transferSuccess = transfer(_to, _bid);
-        if (!transferSuccess) {
-            revert transferFail();
-        }
         if (_isContract(_to)) {
-            bool success = INFTMarket(_to).tokensReceived(
-                msg.sender,
-                _tokenId,
-                _bid
-            );
-            if (!success) {
-                revert NoTokenReceived();
-            }
+            INFTMarket(_to).tokensReceived(msg.sender, _to, _bidAmount, _data);
+        } else {
+            revert NotContract();
         }
         return true;
+    }
+
+    function getBytesOfNFTInfo(
+        address _NFTAddr,
+        uint256 _tokenId
+    ) public pure returns (bytes memory) {
+        bytes memory NFTInfo = abi.encode(_NFTAddr, _tokenId);
+        return NFTInfo;
     }
 
     function _isContract(address account) internal view returns (bool) {
@@ -239,7 +268,7 @@ contract ERC777TokenGTT is ERC20, ERC20Permit, ReentrancyGuard {
 ## 合约部署、验证
 
 **ERC777 Token 合约 URL**：
-https://mumbai.polygonscan.com/address/0x7BdBE8630C134960D037033339A202f5e2Fb8f1E
+https://mumbai.polygonscan.com/address/0xDBaA831fc0Ff91FF67A3eD5C6c708E6854CE6EfF
 
 **NFTMarket 合约 URL**：
-https://mumbai.polygonscan.com/address/0x67e34b647b4fe15738ae5225B651D8a06A0ae229
+https://mumbai.polygonscan.com/address/0x7AFAE725f49F18ea048B1B963b4Fbc954492C1b8
